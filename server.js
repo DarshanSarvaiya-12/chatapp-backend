@@ -11,7 +11,7 @@ const helmet = require("helmet");
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10kb" }));
 app.use(helmet());
 
 const server = http.createServer(app);
@@ -34,7 +34,9 @@ mongoose.connect(process.env.MONGO_URI)
 // ── SCHEMAS ──
 const userSchema = new mongoose.Schema({
   username: { type: String, unique: true },
-  password: String
+  password: String,
+  publicKey: String,
+  encryptedPrivateKey: String
 });
 const User = mongoose.model("User", userSchema);
 
@@ -54,13 +56,13 @@ function validatePassword(p) {
   return p && p.length >= 4 && p.length <= 50;
 }
 function validateMessage(t) {
-  return t && t.trim().length > 0 && t.trim().length <= 500;
+  return t && t.trim().length > 0 && t.trim().length <= 2000;
 }
-function getRoomId(userA, userB) {
-  return [userA, userB].sort().join("_");
+function getRoomId(a, b) {
+  return [a, b].sort().join("_");
 }
 
-// ── MIDDLEWARE ──
+// ── AUTH MIDDLEWARE ──
 function authMiddleware(req, res, next) {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) return res.status(401).json({ error: "Unauthorized" });
@@ -75,18 +77,29 @@ function authMiddleware(req, res, next) {
 // ── REGISTER ──
 app.post("/register", authLimiter, async (req, res) => {
   try {
-    const { username, password } = req.body;
-    if (!username || !password)
+    const { username, password, publicKey, encryptedPrivateKey } = req.body;
+
+    if (!username || !password || !publicKey || !encryptedPrivateKey)
       return res.status(400).json({ error: "All fields required" });
+
     if (!validateUsername(username))
       return res.status(400).json({ error: "Username: 3-20 chars, letters/numbers/underscore only" });
+
     if (!validatePassword(password))
       return res.status(400).json({ error: "Password must be 4-50 characters" });
+
     const exists = await User.findOne({ username });
     if (exists)
       return res.status(400).json({ error: "Username already taken" });
+
     const hashed = await bcrypt.hash(password, 10);
-    await new User({ username, password: hashed }).save();
+    await new User({
+      username,
+      password: hashed,
+      publicKey,
+      encryptedPrivateKey
+    }).save();
+
     const token = jwt.sign({ username }, process.env.JWT_SECRET);
     res.json({ token, username });
   } catch {
@@ -98,29 +111,39 @@ app.post("/register", authLimiter, async (req, res) => {
 app.post("/login", authLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
+
     if (!username || !password)
       return res.status(400).json({ error: "All fields required" });
+
     if (!validateUsername(username))
       return res.status(400).json({ error: "Invalid username format" });
+
     const user = await User.findOne({ username });
     if (!user)
       return res.status(400).json({ error: "User not found" });
+
     const match = await bcrypt.compare(password, user.password);
     if (!match)
       return res.status(400).json({ error: "Wrong password" });
+
     const token = jwt.sign({ username }, process.env.JWT_SECRET);
-    res.json({ token, username });
+    res.json({
+      token,
+      username,
+      publicKey: user.publicKey,
+      encryptedPrivateKey: user.encryptedPrivateKey
+    });
   } catch {
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// ── GET ALL USERS ──
+// ── GET ALL USERS WITH PUBLIC KEYS ──
 app.get("/users", authMiddleware, async (req, res) => {
   try {
     const users = await User.find(
       { username: { $ne: req.user.username } },
-      { username: 1, _id: 0 }
+      { username: 1, publicKey: 1, _id: 0 }
     );
     res.json(users);
   } catch {
@@ -128,7 +151,21 @@ app.get("/users", authMiddleware, async (req, res) => {
   }
 });
 
-// ── GET MESSAGES FOR A ROOM ──
+// ── GET SINGLE USER PUBLIC KEY ──
+app.get("/user/:username", authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findOne(
+      { username: req.params.username },
+      { username: 1, publicKey: 1, _id: 0 }
+    );
+    if (!user) return res.status(404).json({ error: "User not found" });
+    res.json(user);
+  } catch {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ── GET MESSAGES ──
 app.get("/messages/:roomId", authMiddleware, async (req, res) => {
   try {
     const messages = await Message.find({ roomId: req.params.roomId })
@@ -143,27 +180,24 @@ app.get("/messages/:roomId", authMiddleware, async (req, res) => {
 io.on("connection", (socket) => {
   console.log("Connected:", socket.id);
 
-  // Join private room
   socket.on("join_room", ({ userA, userB }) => {
     const roomId = getRoomId(userA, userB);
     socket.join(roomId);
-    console.log(`${userA} joined room: ${roomId}`);
   });
 
-  // Send message to room
   socket.on("send_message", async (data) => {
     if (!data.username || !data.roomId || !validateMessage(data.text)) return;
-    const cleanText = data.text.trim()
-      .replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
     const msg = new Message({
       roomId: data.roomId,
       username: data.username,
-      text: cleanText
+      text: data.text
     });
     await msg.save();
+
     io.to(data.roomId).emit("receive_message", {
       username: data.username,
-      text: cleanText,
+      text: data.text,
       timestamp: msg.timestamp
     });
   });
