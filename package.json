@@ -12,6 +12,8 @@
     "dotenv": "*",
     "mongoose": "*",
     "bcryptjs": "*",
-    "jsonwebtoken": "*"
+    "jsonwebtoken": "*",
+    "helmet": "*",
+    "express-rate-limit": "*"
   }
 }
