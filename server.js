@@ -21,74 +21,75 @@ const io = new Server(server, {
 
 // ── RATE LIMITING ──
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10, // max 10 attempts
+  windowMs: 15 * 60 * 1000,
+  max: 10,
   message: { error: "Too many attempts. Try again in 15 minutes." }
 });
 
-// ── CONNECT MONGODB ──
+// ── MONGODB ──
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log("MongoDB connected"))
   .catch((err) => console.log("DB Error:", err));
 
-// ── USER SCHEMA ──
+// ── SCHEMAS ──
 const userSchema = new mongoose.Schema({
   username: { type: String, unique: true },
   password: String
 });
 const User = mongoose.model("User", userSchema);
 
-// ── MESSAGE SCHEMA ──
 const messageSchema = new mongoose.Schema({
+  roomId: String,
   username: String,
   text: String,
   timestamp: { type: Date, default: Date.now }
 });
 const Message = mongoose.model("Message", messageSchema);
 
-// ── INPUT VALIDATION ──
-function validateUsername(username) {
-  // Only letters, numbers, underscore. 3-20 chars
-  const regex = /^[a-zA-Z0-9_]{3,20}$/;
-  return regex.test(username);
+// ── VALIDATION ──
+function validateUsername(u) {
+  return /^[a-zA-Z0-9_]{3,20}$/.test(u);
+}
+function validatePassword(p) {
+  return p && p.length >= 4 && p.length <= 50;
+}
+function validateMessage(t) {
+  return t && t.trim().length > 0 && t.trim().length <= 500;
+}
+function getRoomId(userA, userB) {
+  return [userA, userB].sort().join("_");
 }
 
-function validatePassword(password) {
-  // Min 4 chars, max 50
-  return password && password.length >= 4 && password.length <= 50;
-}
-
-function validateMessage(text) {
-  // Not empty, max 500 chars
-  return text && text.trim().length > 0 && text.trim().length <= 500;
+// ── MIDDLEWARE ──
+function authMiddleware(req, res, next) {
+  const token = req.headers.authorization?.split(" ")[1];
+  if (!token) return res.status(401).json({ error: "Unauthorized" });
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: "Invalid token" });
+  }
 }
 
 // ── REGISTER ──
 app.post("/register", authLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
-
     if (!username || !password)
       return res.status(400).json({ error: "All fields required" });
-
     if (!validateUsername(username))
-      return res.status(400).json({ error: "Username must be 3-20 characters. Only letters, numbers, underscore allowed." });
-
+      return res.status(400).json({ error: "Username: 3-20 chars, letters/numbers/underscore only" });
     if (!validatePassword(password))
       return res.status(400).json({ error: "Password must be 4-50 characters" });
-
     const exists = await User.findOne({ username });
     if (exists)
       return res.status(400).json({ error: "Username already taken" });
-
     const hashed = await bcrypt.hash(password, 10);
-    const user = new User({ username, password: hashed });
-    await user.save();
-
+    await new User({ username, password: hashed }).save();
     const token = jwt.sign({ username }, process.env.JWT_SECRET);
     res.json({ token, username });
-
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -97,57 +98,70 @@ app.post("/register", authLimiter, async (req, res) => {
 app.post("/login", authLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
-
     if (!username || !password)
       return res.status(400).json({ error: "All fields required" });
-
     if (!validateUsername(username))
       return res.status(400).json({ error: "Invalid username format" });
-
     const user = await User.findOne({ username });
     if (!user)
       return res.status(400).json({ error: "User not found" });
-
     const match = await bcrypt.compare(password, user.password);
     if (!match)
       return res.status(400).json({ error: "Wrong password" });
-
     const token = jwt.sign({ username }, process.env.JWT_SECRET);
     res.json({ token, username });
-
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// ── LOAD MESSAGES ──
-app.get("/messages", async (req, res) => {
-  const messages = await Message.find()
-    .sort({ timestamp: 1 }).limit(50);
-  res.json(messages);
+// ── GET ALL USERS ──
+app.get("/users", authMiddleware, async (req, res) => {
+  try {
+    const users = await User.find(
+      { username: { $ne: req.user.username } },
+      { username: 1, _id: 0 }
+    );
+    res.json(users);
+  } catch {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ── GET MESSAGES FOR A ROOM ──
+app.get("/messages/:roomId", authMiddleware, async (req, res) => {
+  try {
+    const messages = await Message.find({ roomId: req.params.roomId })
+      .sort({ timestamp: 1 }).limit(50);
+    res.json(messages);
+  } catch {
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
 // ── SOCKET.IO ──
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
+  console.log("Connected:", socket.id);
 
+  // Join private room
+  socket.on("join_room", ({ userA, userB }) => {
+    const roomId = getRoomId(userA, userB);
+    socket.join(roomId);
+    console.log(`${userA} joined room: ${roomId}`);
+  });
+
+  // Send message to room
   socket.on("send_message", async (data) => {
-    // Validate message on server side too
-    if (!data.username || !validateMessage(data.text)) return;
-
-    // Sanitize — strip HTML tags
-    const cleanText = data.text
-      .trim()
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-
+    if (!data.username || !data.roomId || !validateMessage(data.text)) return;
+    const cleanText = data.text.trim()
+      .replace(/</g, "&lt;").replace(/>/g, "&gt;");
     const msg = new Message({
+      roomId: data.roomId,
       username: data.username,
       text: cleanText
     });
     await msg.save();
-
-    io.emit("receive_message", {
+    io.to(data.roomId).emit("receive_message", {
       username: data.username,
       text: cleanText,
       timestamp: msg.timestamp
@@ -155,10 +169,9 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
-    console.log("User disconnected:", socket.id);
+    console.log("Disconnected:", socket.id);
   });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () =>
-  console.log("Server running on port", PORT));
+server.listen(PORT, () => console.log("Server running on port", PORT));
