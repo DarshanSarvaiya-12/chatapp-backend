@@ -12,6 +12,7 @@ const helmet = require("helmet");
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10kb" }));
+app.set("trust proxy", 1);
 app.use(helmet());
 
 const server = http.createServer(app);
